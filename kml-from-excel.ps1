@@ -120,3 +120,7 @@ Write-Host "KML file generated successfully: $kmlFilePath"
 
 # Cleanup
 Cleanup-Excel -worksheet $worksheet -workbook $workbook -excel $excel
+
+
+
+##### TODO add back in SCHEMADATA elements and simpleField/SimpleData to display the column elements in a table on the pin...
