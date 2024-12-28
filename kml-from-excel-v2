@@ -1,0 +1,195 @@
+# Load required assemblies
+Add-Type -AssemblyName System.Web
+Add-Type -AssemblyName System.Windows.Forms
+
+# Define a class for handling Excel data
+class ExcelData {
+    [string[]]$Headers
+    [array]$Rows
+
+    ExcelData() {
+        $this.Headers = @()
+        $this.Rows = @()
+    }
+
+    [void]LoadData($worksheet) {
+        $usedRange = $worksheet.UsedRange
+        if ($usedRange.Rows.Count -lt 2) {
+            Write-Host "Excel file does not contain enough data. Exiting script."
+            exit
+        }
+
+        $this.Headers = @()
+        # Extract headers
+        for ($col = 1; $col -le $usedRange.Columns.Count; $col++) {
+            $header = $worksheet.Cells.Item(1, $col).Value2
+            if ($header) { $this.Headers += $header }
+        }
+
+        # Extract rows as objects
+        for ($row = 2; $row -le $usedRange.Rows.Count; $row++) {
+            $rowData = @{}
+            for ($col = 1; $col -le $usedRange.Columns.Count; $col++) {
+                $header = $this.Headers[$col - 1]
+                $value = $worksheet.Cells.Item($row, $col).Value2
+                if ($header) { $rowData[$header] = $value }
+            }
+            $this.Rows += $rowData
+        }
+    }
+}
+
+# Define a class for generating KML
+class KmlGenerator {
+    [string]$Schema
+    [string]$Placemarks
+
+    KmlGenerator() {
+        $this.Schema = ""
+        $this.Placemarks = ""
+    }
+
+    [void]GenerateSchema($headers) {
+        $this.Schema = "<Schema name='schema0' id='schema0'>`n"
+        foreach ($header in $headers) {
+            $this.Schema += "<SimpleField type='string' name='$header'></SimpleField>`n"
+        }
+        $this.Schema += "</Schema>`n"
+    }
+
+    [string]GenerateStyle($color) {
+        # Generate dynamic style based on color
+        $color = $color.ToLower()
+        if ($color -notin @('red', 'yellow', 'green', 'blue')) {
+            $color = 'red' # Default color if invalid
+        }
+        return @"
+<Style id="pdfmaps_style_$color">
+  <IconStyle>
+    <Icon>
+      <href>http://download.avenza.com/images/pdfmaps_icons/v2/pin-$color-inground.png</href>
+    </Icon>
+  </IconStyle>
+</Style>
+"@
+    }
+
+    [void]GeneratePlacemarks($rows, $headers) {
+        $pinColorIndex = $headers.IndexOf("PINCOLOR") # Get index of PINCOLOR column
+        foreach ($row in $rows) {
+            $color = if ($row.ContainsKey("PINCOLOR")) { $row["PINCOLOR"] } else { "red" }
+            $styleUrl = "pdfmaps_style_$($color.ToLower())"
+
+            $placemark = @"
+<Placemark>
+  <styleUrl>#$styleUrl</styleUrl>
+"@
+            foreach ($key in $row.Keys) {
+                $value = [System.Web.HttpUtility]::HtmlEncode($row[$key])
+                $placemark += "<SimpleData name='$key'>$value</SimpleData>`n"
+            }
+            $placemark += "</Placemark>`n"
+            $this.Placemarks += $placemark
+        }
+    }
+
+    [string]BuildKml($styles) {
+        return @"
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2" xmlns:kml="http://www.opengis.net/kml/2.2" xmlns:atom="http://www.w3.org/2005/Atom">
+<Document>
+$this.Schema
+$styles
+$this.Placemarks
+</Document>
+</kml>
+"@
+    }
+}
+
+# Utility functions
+function Prompt-UserForFile {
+    param (
+        [string]$Filter,
+        [string]$InitialDirectory
+    )
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Filter = $Filter
+    $dialog.InitialDirectory = $InitialDirectory
+    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        return $dialog.FileName
+    } else {
+        Write-Host "No file selected. Exiting script."
+        exit
+    }
+}
+
+function Prompt-UserToSaveFile {
+    param (
+        [string]$Filter,
+        [string]$InitialDirectory,
+        [string]$DefaultFileName
+    )
+    $dialog = New-Object System.Windows.Forms.SaveFileDialog
+    $dialog.Filter = $Filter
+    $dialog.InitialDirectory = $InitialDirectory
+    $dialog.FileName = $DefaultFileName
+    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        return $dialog.FileName
+    } else {
+        Write-Host "Save operation canceled. Exiting script."
+        exit
+    }
+}
+
+function Cleanup-Excel {
+    param (
+        $worksheet, $workbook, $excel
+    )
+    try {
+        $workbook.Close($False)
+        $excel.Quit()
+    } catch {
+        Write-Warning "Error while closing Excel: $_"
+    }
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($worksheet) | Out-Null
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($workbook) | Out-Null
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
+}
+
+# Main script
+$excelFilePath = Prompt-UserForFile -Filter "Excel Files (*.xlsx)|*.xlsx" -InitialDirectory "C:\"
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false
+$excel.DisplayAlerts = $false
+$workbook = $excel.Workbooks.Open($excelFilePath)
+$worksheet = $workbook.Sheets.Item(1)
+
+# Load Excel data
+$excelData = [ExcelData]::new()
+$excelData.LoadData($worksheet)
+
+# Generate KML
+$kmlGenerator = [KmlGenerator]::new()
+$kmlGenerator.GenerateSchema($excelData.Headers)
+
+# Generate styles for all unique colors
+$uniqueColors = ($excelData.Rows | Where-Object { $_.ContainsKey("PINCOLOR") } | ForEach-Object { $_["PINCOLOR"].ToLower() }) | Sort-Object -Unique
+$styles = ""
+foreach ($color in $uniqueColors) {
+    $styles += $kmlGenerator.GenerateStyle($color)
+}
+
+$kmlGenerator.GeneratePlacemarks($excelData.Rows, $excelData.Headers)
+$kmlContent = $kmlGenerator.BuildKml($styles)
+
+# Save KML file
+$kmlFilePath = Prompt-UserToSaveFile -Filter "KML Files (*.kml)|*.kml" -InitialDirectory "C:\" -DefaultFileName "pins-from-EXCEL.kml"
+$kmlContent | Set-Content -Path $kmlFilePath -Encoding UTF8 -Force
+
+Write-Host "KML file generated successfully: $kmlFilePath"
+
+# Cleanup
+Cleanup-Excel -worksheet $worksheet -workbook $workbook -excel $excel
